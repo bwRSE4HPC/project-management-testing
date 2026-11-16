@@ -1,0 +1,69 @@
+name: Issue scheduling
+
+# Keeps a parent issue and its sub issues scheduled from the per-sub-task
+# `Duration` field: sub tasks run back to back in creation order, the parent's
+# target date is the last sub task's target. See scripts/schedule_issues.py.
+
+on:
+  issues:
+    # opened        new parent or new sub issue -> recompute the whole chain
+    # field_added   also fires when a value is *changed* (measured), so a
+    #               Duration edit lands here rather than on a separate type
+    #
+    # field_removed is deliberately absent: clearing a Duration or a start date
+    # leaves every date untouched (agreed behaviour), so a run for it could only
+    # write nothing. Adding it back would also mean deciding whether clearing the
+    # parent's start should re-seed it from its creation date.
+    types: [opened, field_added]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Parent issue (or one of its sub issues) to recompute
+        required: true
+        type: string
+
+permissions:
+  contents: read # checkout
+  issues: write # setIssueFieldValue
+
+# Two runs on one issue would race each other's reads and writes; queue them
+# instead of cancelling, since a queued run is exactly the repair the previous
+# one may have left half-applied.
+concurrency:
+  group: issue-scheduling-${{ github.event.issue.number || github.event.inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number || github.event.inputs.issue_number }}
+      TRIGGER_EVENT: ${{ github.event_name }}
+      TRIGGER_ACTION: ${{ github.event.action }}
+      CHANGED_FIELD: ${{ github.event.issue_field.name }}
+      # Names, not ids: resolved to node ids at runtime, and a name that has
+      # been renamed away fails the run instead of silently doing nothing.
+      FIELD_START: Start date
+      FIELD_TARGET: Target date
+      FIELD_DURATION: Duration
+    steps:
+      - uses: actions/checkout@v4
+
+      # The script owns these decisions too; skipping here just avoids booting a
+      # job for a field the schedule never reads. It cannot be a job-level `if`,
+      # because the `env` context is not available there.
+      - name: Schedule
+        if: >
+          github.event_name == 'workflow_dispatch' ||
+          github.event.action == 'opened' ||
+          github.event.issue_field.name == env.FIELD_DURATION ||
+          github.event.issue_field.name == env.FIELD_START
+        run: |
+          set -o pipefail
+          { echo '```'
+            python3 scripts/schedule_issues.py
+            echo '```'
+          } | tee "$GITHUB_STEP_SUMMARY"
