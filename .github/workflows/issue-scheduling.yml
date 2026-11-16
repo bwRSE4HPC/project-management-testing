@@ -2,7 +2,8 @@ name: Issue scheduling
 
 # Keeps a parent issue and its sub issues scheduled from the per-sub-task
 # `Duration` field: sub tasks run back to back in creation order, the parent's
-# target date is the last sub task's target. See scripts/schedule_issues.py.
+# target date is the last sub task's target and its Duration is the sum of the
+# scheduled sub tasks. See scripts/schedule_issues.py.
 
 on:
   issues:
@@ -11,7 +12,7 @@ on:
     #               Duration edit lands here rather than on a separate type
     #
     # field_removed is deliberately absent: clearing a Duration or a start date
-    # leaves every date untouched (agreed behaviour), so a run for it could only
+    # leaves every value untouched (agreed behaviour), so a run for it could only
     # write nothing. Adding it back would also mean deciding whether clearing the
     # parent's start should re-seed it from its creation date.
     types: [opened, field_added]
@@ -55,6 +56,12 @@ jobs:
       # The script owns these decisions too; skipping here just avoids booting a
       # job for a field the schedule never reads. It cannot be a job-level `if`,
       # because the `env` context is not available there.
+      #
+      # FIELD_DURATION passes on a parent too, which the script resolves into a
+      # no-op: the parent's own Duration is a rollup the script writes itself, so
+      # an event for that write must not start another reschedule. A GITHUB_TOKEN
+      # write starts no run at all, so this cannot loop; were a PAT ever swapped
+      # in, the script's own rule is what stops it.
       - name: Schedule
         if: >
           github.event_name == 'workflow_dispatch' ||

@@ -6,18 +6,24 @@ Model
     weeks, running back to back in creation order, and the parent's target date
     is the last scheduled sub task's end date:
 
-        parent.start  = parent Start date, or createdAt when that field is empty
-        sub[n].start  = sub[n-1].target + 1 day    (sub[0].start = parent.start)
-        sub[n].target = sub[n].start + 7 * duration - 1 day
-        parent.target = last scheduled sub task's target
+        parent.start   = parent Start date, or createdAt when that field is empty
+        sub[n].start   = sub[n-1].target + 1 day    (sub[0].start = parent.start)
+        sub[n].target  = sub[n].start + 7 * duration - 1 day
+        parent.target  = last scheduled sub task's target
+        parent.duration = sum of the scheduled sub tasks' durations
 
     A sub task with no `Duration` gets no dates and stops the chain there: no
     gap is assumed for it and nothing after it is scheduled. The next run picks
-    it up once the value arrives.
+    it up once the value arrives. The parent's `Duration` rollup stops at the
+    same point, so it always describes what the parent's dates actually cover.
+
+    Setting the parent's own `Duration` by hand starts no work: it is an output,
+    not an input, and the next run overwrites it with the new sum.
 
     The parent's Start date is seeded once, when empty, and never overwritten;
     afterwards it is read back as the anchor. Every other value this script owns
-    — the parent target and all sub-task dates — is recomputed unconditionally.
+    — the parent target, the parent duration rollup and all sub-task dates — is
+    recomputed unconditionally.
 
 Flows
     full     (workflow_dispatch, or an `opened` issue)
@@ -25,9 +31,9 @@ Flows
         last, so `opened` on a sub task is a full recompute too.
     cascade  (`field_added` / `field_removed` on a sub issue, Duration only)
         Anchors on the edited sub task's stored start date and rewrites it, its
-        successors and the parent target. Earlier sub tasks are left alone. If
-        the anchor is missing, or an earlier sub task has no target to hand off
-        from, the run falls back to a full recompute.
+        successors and the parent target and duration. Earlier sub tasks are
+        left alone. If the anchor is missing, or an earlier sub task has no
+        target to hand off from, the run falls back to a full recompute.
 
 Transport
     Every call is GraphQL through `gh api graphql`, which reads GITHUB_TOKEN
@@ -167,6 +173,8 @@ class Issue:
         self.parent: int | None = raw["parent"]["number"] if raw.get("parent") else None
         self.stored_start = parse_date(values.get(names["start"]))
         self.stored_target = parse_date(values.get(names["target"]))
+        # `duration` is the sub task's input and, on the parent, the rollup this
+        # script writes — so it doubles as the stored value to compare against.
         self.duration, self.duration_error = parse_duration(values.get(names["duration"]))
 
     @property
@@ -175,6 +183,9 @@ class Issue:
 
     def show(self, value: date | None) -> str:
         return value.isoformat() if value else "-"
+
+    def show_number(self, value: float | None) -> str:
+        return f"{value:g}" if value is not None else "-"
 
 
 # --------------------------------------------------------------------------- #
@@ -259,12 +270,27 @@ def last_target(scheduled: list[tuple[date, date] | None]) -> date | None:
     return None
 
 
+def total_duration(durations: list[float | None]) -> float | None:
+    """Parent's Duration: the weeks its scheduled span covers.
+
+    Only the sub tasks the parent's dates actually reach are counted. `None` —
+    write nothing — when the span is empty or one of the covered sub tasks has
+    no duration, because a partial sum would read as a total.
+    """
+    known = [weeks for weeks in durations if weeks is not None]
+    if not known or len(known) != len(durations):
+        return None
+    # Weeks are user-typed decimals, so drop the binary-sum noise before it
+    # reaches a field: 0.1 + 0.2 must compare equal to the 0.3 read back.
+    return round(sum(known), 6)
+
+
 # --------------------------------------------------------------------------- #
 # Writes
 # --------------------------------------------------------------------------- #
 
 
-def write_dates(
+def write_values(
     issue: Issue,
     want_start: date | None,
     want_target: date | None,
@@ -272,41 +298,52 @@ def write_dates(
     names: dict[str, str],
     allow_start_write: bool,
     dry_run: bool,
+    want_duration: float | None = None,
 ) -> list[str]:
-    """Bulk-write an issue's dates, skipping fields that already match.
+    """Bulk-write an issue's schedule fields, skipping fields that already match.
 
     `allow_start_write` is False for a parent that already has a start date: the
     computed anchor is reported but never written over the stored value.
     Returns one human-readable note per field.
     """
-    fields: list[dict[str, str]] = []
+    fields: list[dict[str, Any]] = []
+    changed: list[str] = []
     notes: list[str] = []
 
     for role, want, stored in (
         ("start", want_start, issue.stored_start),
         ("target", want_target, issue.stored_target),
+        ("duration", want_duration, issue.duration),
     ):
         name = names[role]
+        # Dates travel as ISO strings, numbers as JSON numbers: `numberValue`
+        # rejects a quoted one.
+        numeric = role == "duration"
+        shown = issue.show_number(want) if numeric else issue.show(want)
+        was = issue.show_number(stored) if numeric else issue.show(stored)
         if want is None:
-            notes.append(f"{name}: left as {issue.show(stored)}")
+            notes.append(f"{name}: left as {was}")
             continue
         if stored == want:
-            notes.append(f"{name}: unchanged ({want.isoformat()})")
+            notes.append(f"{name}: unchanged ({shown})")
             continue
         if role == "start" and not allow_start_write:
             notes.append(
-                f"{name}: kept at {issue.show(stored)}, computed {want.isoformat()} "
+                f"{name}: kept at {was}, computed {shown} "
                 "but a parent start date is never overwritten"
             )
             continue
-        fields.append({"fieldId": ids[role], "dateValue": want.isoformat()})
-        notes.append(f"{name}: {issue.show(stored)} -> {want.isoformat()}")
+        if numeric:
+            fields.append({"fieldId": ids[role], "numberValue": want})
+        else:
+            fields.append({"fieldId": ids[role], "dateValue": want.isoformat()})
+        changed.append(f"{name} {shown}")
+        notes.append(f"{name}: {was} -> {shown}")
 
     if not fields:
         return notes
     if dry_run:
-        return [f"[dry-run] would write {len(fields)} field(s): "
-                + ", ".join(f["dateValue"] for f in fields)] + notes
+        return [f"[dry-run] would write {len(fields)}: " + ", ".join(changed)] + notes
     gh_graphql(SET_VALUES_MUTATION, {"id": issue.node_id, "fields": fields})
     return notes
 
@@ -346,28 +383,36 @@ def run_full(
 
     scheduled = compute_cascade(anchor, [sub.duration for sub in subs])
     target = last_target(scheduled)
+    # The parent's own Duration is a rollup of the sub tasks its dates reach.
+    total = total_duration([
+        sub.duration for sub, slot in zip(subs, scheduled) if slot is not None
+    ])
     warn_invalid_durations(subs)
 
     print(f"plan (full recompute, {len(subs)} sub issues)")
     print(f"  {parent.label}  start {parent.show(parent.stored_start or anchor):<10} "
-          f"target {parent.show(target):<10} parent")
+          f"target {parent.show(target):<10} "
+          f"duration {parent.show_number(total):<5} parent")
     for sub, slot in zip(subs, scheduled):
         if slot is None:
             why = sub.duration_error or "duration not set"
             print(f"  {sub.label}  start {sub.show(sub.stored_start):<10} "
-                  f"target {sub.show(sub.stored_target):<10} skipped: {why}")
+                  f"target {sub.show(sub.stored_target):<10} "
+                  f"duration {sub.show_number(sub.duration):<5} skipped: {why}")
         else:
             print(f"  {sub.label}  start {slot[0].isoformat():<10} "
-                  f"target {slot[1].isoformat():<10} {sub.duration:g}w")
+                  f"target {slot[1].isoformat():<10} "
+                  f"duration {sub.show_number(sub.duration):<5}")
 
-    report(parent, write_dates(
+    report(parent, write_values(
         parent, anchor, target, ids, names,
         allow_start_write=parent.stored_start is None, dry_run=dry_run,
+        want_duration=total,
     ))
     for sub, slot in zip(subs, scheduled):
         if slot is None:
             continue
-        report(sub, write_dates(
+        report(sub, write_values(
             sub, slot[0], slot[1], ids, names, allow_start_write=True, dry_run=dry_run,
         ))
     return 1 if any(sub.duration_error for sub in subs) else 0
@@ -400,40 +445,56 @@ def run_cascade(
 
     scheduled = compute_cascade(edited.stored_start, [sub.duration for sub in subs[index:]])
     target = last_target(scheduled)
+    # The parent's Duration covers everything its span holds: the sub tasks left
+    # upstream plus the ones re-chained here. An upstream Duration that was
+    # cleared since its dates were written makes the sum unknowable, so the
+    # field is left alone rather than given a sum that reads as a total.
+    total = total_duration(
+        [sub.duration for sub in earlier]
+        + [sub.duration for sub, slot in zip(subs[index:], scheduled) if slot is not None]
+    )
     warn_invalid_durations(subs[index:])
 
     print(f"plan (cascade from {edited.label}, anchor "
           f"{edited.stored_start.isoformat()}, {len(earlier)} left untouched)")
     for sub in earlier:
         print(f"  {sub.label}  start {sub.show(sub.stored_start):<10} "
-              f"target {sub.show(sub.stored_target):<10} untouched")
+              f"target {sub.show(sub.stored_target):<10} "
+              f"duration {sub.show_number(sub.duration):<5} untouched")
     for offset, slot in enumerate(scheduled):
         sub = subs[index + offset]
         if slot is None:
             why = sub.duration_error or "duration not set"
             print(f"  {sub.label}  start {sub.show(sub.stored_start):<10} "
-                  f"target {sub.show(sub.stored_target):<10} skipped: {why}")
+                  f"target {sub.show(sub.stored_target):<10} "
+                  f"duration {sub.show_number(sub.duration):<5} skipped: {why}")
         else:
             print(f"  {sub.label}  start {slot[0].isoformat():<10} "
-                  f"target {slot[1].isoformat():<10} {sub.duration:g}w")
+                  f"target {slot[1].isoformat():<10} "
+                  f"duration {sub.show_number(sub.duration):<5}")
     # When nothing after the gap is schedulable there is no target to write, so
     # show what the parent keeps instead of a blank.
-    parent_note = ("parent target only" if target is not None
-                   else "no parent target computable, left as stored")
+    if target is not None:
+        parent_note = "parent target and duration only"
+    elif total is not None:
+        parent_note = "parent duration only, no target computable"
+    else:
+        parent_note = "nothing computable for the parent, left as stored"
     print(f"  {parent.label}  start {parent.show(parent.stored_start):<10} "
-          f"target {parent.show(target or parent.stored_target):<10} {parent_note}")
+          f"target {parent.show(target or parent.stored_target):<10} "
+          f"duration {parent.show_number(total):<5} {parent_note}")
 
     for offset, slot in enumerate(scheduled):
         if slot is None:
             continue
         sub = subs[index + offset]
-        report(sub, write_dates(
+        report(sub, write_values(
             sub, slot[0], slot[1], ids, names, allow_start_write=True, dry_run=dry_run,
         ))
-    if target is not None:
-        report(parent, write_dates(
+    if target is not None or total is not None:
+        report(parent, write_values(
             parent, None, target, ids, names,
-            allow_start_write=False, dry_run=dry_run,
+            allow_start_write=False, dry_run=dry_run, want_duration=total,
         ))
     return 1 if any(sub.duration_error for sub in subs[index:]) else 0
 
@@ -520,7 +581,9 @@ def main() -> int:
 
     # What the schedule actually reads: a sub task's Duration, and the parent's
     # Start date, which is the chain anchor. A field event for anything else must
-    # not reschedule, or the run would overwrite the value just edited.
+    # not reschedule, or the run would overwrite the value just edited. A hand-set
+    # parent Duration is exactly that value, and in both directions: this event is
+    # ignored, and a later run replaces it with the sum of the sub tasks.
     field_event = action in ("field_added", "field_removed")
     top_level = trigger.parent is None
     if not field_event:
@@ -532,7 +595,8 @@ def main() -> int:
     if not depends:
         print(f"{changed or 'an unknown field'} changed on {trigger.label}: the "
               f"schedule reads {names['duration']!r} on a sub issue and "
-              f"{names['start']!r} on the parent only")
+              f"{names['start']!r} on the parent only; a parent's own "
+              f"{names['duration']!r} is output, summed from its sub issues")
         return 0
 
     # A Duration change on a sub issue is the one case that can be answered

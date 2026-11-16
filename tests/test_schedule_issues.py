@@ -79,6 +79,17 @@ def test_last_target():
           s.last_target(s.compute_cascade(D(2026, 10, 4), [None])), None)
 
 
+def test_total_duration():
+    check("the parent's weeks are its sub tasks' weeks added up",
+          s.total_duration([2, 1, 3, 1, 2]), 9.0)
+    check("part weeks add up too", s.total_duration([0.5, 1.25]), 1.75)
+    check("binary float noise does not leak into the field",
+          s.total_duration([0.1, 0.2]), 0.3)
+    check("an unknown duration makes the total unknown",
+          s.total_duration([2, None, 1]), None)
+    check("no sub tasks means no total", s.total_duration([]), None)
+
+
 def test_parsers():
     check("a blank duration reads as unset", s.parse_duration(None), (None, None))
     check("an empty duration reads as unset", s.parse_duration(""), (None, None))
@@ -128,22 +139,26 @@ class FakeGraphQL:
             n = v["number"]
             return {"repository": {"issue": raw(n, parent=1 if n in self.subs else None)}}
         if query is s.SET_VALUES_MUTATION:
-            writes.append((v["id"], [(f["fieldId"], f.get("dateValue"))
+            writes.append((v["id"], [(f["fieldId"], f.get("dateValue", f.get("numberValue")))
                                      for f in v["fields"]]))
             for field in v["fields"]:
                 name = {"IFD_start": "Start date",
-                        "IFD_target": "Target date"}[field["fieldId"]]
-                state[NODE_TO_NUMBER[v["id"]]][name] = field["dateValue"]
+                        "IFD_target": "Target date",
+                        "IFN_dur": "Duration"}[field["fieldId"]]
+                key = "dateValue" if "dateValue" in field else "numberValue"
+                state[NODE_TO_NUMBER[v["id"]]][name] = field[key]
             return {"setIssueFieldValue": {"clientMutationId": None}}
         raise AssertionError("unexpected query")
 
 
 def reset(parent_start="2026-10-04", parent_target="2026-11-30", durations=True,
-          sub_dates=None):
+          sub_dates=None, parent_duration=None):
     """Start from a clean, known issue set and install the fake transport."""
     writes.clear()
     state.clear()
     state[1] = {"Start date": parent_start, "Target date": parent_target}
+    if parent_duration is not None:
+        state[1]["Duration"] = parent_duration
     for n in SUBS:
         state[n] = {}
         if durations:
@@ -156,7 +171,7 @@ def reset(parent_start="2026-10-04", parent_target="2026-11-30", durations=True,
 
 
 def ids_written(node):
-    """{fieldId: dateValue} across every mutation for one issue."""
+    """{fieldId: value} across every mutation for one issue."""
     out = {}
     for nid, fields in writes:
         if nid == node:
@@ -180,10 +195,42 @@ def test_full_recompute():
          ("2026-10-25", "2026-11-14"), ("2026-11-15", "2026-11-21"),
          ("2026-11-22", "2026-12-05")])
     check("parent target is the last sub's target",
-          ids_written("NODE1"), {"IFD_target": "2026-12-05"})
+          ids_written("NODE1"), {"IFD_target": "2026-12-05", "IFN_dur": 9.0})
     check("parent start is never rewritten", "IFD_start" in ids_written("NODE1"), False)
     check("a sub that is already right is not written at all", touched("NODE2"), False)
     check("one mutation per changed issue", len(writes), 5)
+
+
+def test_parent_duration_is_the_sum_of_sub_tasks():
+    parent = reset(sub_dates={2: ("2026-10-04", "2026-10-17")})
+    s.run_full("o", "r", parent, IDS, NAMES, dry_run=False)
+    check("the parent's Duration is the sum of its sub tasks",
+          state[1].get("Duration"), 9.0)
+
+    parent = reset(parent_target="2026-12-05", parent_duration=9,
+                   sub_dates={2: ("2026-10-04", "2026-10-17")})
+    s.run_full("o", "r", parent, IDS, NAMES, dry_run=False)
+    check("a parent that already adds up is not written at all",
+          touched("NODE1"), False)
+
+    parent = reset(parent_duration=99,  # hand-set and wrong
+                   sub_dates={2: ("2026-10-04", "2026-10-17")})
+    s.run_full("o", "r", parent, IDS, NAMES, dry_run=False)
+    check("a hand-set parent Duration loses to the sum",
+          ids_written("NODE1").get("IFN_dur"), 9.0)
+
+    parent = reset(sub_dates={2: ("2026-10-04", "2026-10-17")})
+    state[4].pop("Duration")
+    s.run_full("o", "r", parent, IDS, NAMES, dry_run=False)
+    check("the sum stops where the chain stops, so #5 and #6 are not counted",
+          ids_written("NODE1").get("IFN_dur"), 3.0)
+
+    parent = reset(sub_dates={2: ("2026-10-04", "2026-10-17")})
+    for n in SUBS:
+        state[n].pop("Duration")
+    s.run_full("o", "r", parent, IDS, NAMES, dry_run=False)
+    check("nothing is schedulable, so no parent Duration is written",
+          "IFN_dur" in ids_written("NODE1"), False)
 
 
 def test_parent_start_is_seeded_once():
@@ -203,10 +250,10 @@ def test_parent_start_is_seeded_once():
     check("but it is still not written back", "IFD_start" in ids_written("NODE1"), False)
 
 
-def test_write_dates_protects_the_parent_start():
+def test_write_values_protects_the_parent_start():
     parent = reset(parent_start="2026-10-04")
-    notes = s.write_dates(parent, D(2027, 5, 1), None, IDS, NAMES,
-                          allow_start_write=False, dry_run=False)
+    notes = s.write_values(parent, D(2027, 5, 1), None, IDS, NAMES,
+                           allow_start_write=False, dry_run=False)
     check("a caller asking to move a parent start is refused in the note",
           (ids_written("NODE1"), "never overwritten" in notes[0]), ({}, True))
 
@@ -245,7 +292,20 @@ def test_cascade_only_touches_the_edited_sub_and_its_successors():
           (ids_written("NODE5").get("IFD_start"), ids_written("NODE6").get("IFD_target")),
           ("2026-11-22", "2026-12-12"))
     check("the parent target follows the shifted tail",
-          ids_written("NODE1"), {"IFD_target": "2026-12-12"})
+          ids_written("NODE1"), {"IFD_target": "2026-12-12", "IFN_dur": 10.0})
+    check("a cascade re-sums the parent Duration as well",
+          state[1].get("Duration"), 10.0)
+
+
+def test_cascade_cannot_sum_past_an_upstream_gap():
+    parent = reset(sub_dates=ALIGNED)
+    state[2].pop("Duration")  # cleared by hand after its dates were written
+    edited = s.Issue(raw(3, parent=1), NAMES)
+    s.run_cascade("o", "r", edited, parent, IDS, NAMES, dry_run=False)
+    check("the parent target is still recomputed",
+          ids_written("NODE1").get("IFD_target"), "2026-12-05")
+    check("but a total that would be short is never written",
+          "IFN_dur" in ids_written("NODE1"), False)
 
 
 def test_cascade_stops_at_an_unset_duration():
@@ -256,7 +316,7 @@ def test_cascade_stops_at_an_unset_duration():
     check("nothing after the gap is written",
           [touched(f"NODE{n}") for n in (4, 5, 6)], [False, False, False])
     check("the parent target falls back to the last scheduled sub",
-          ids_written("NODE1"), {"IFD_target": "2026-10-24"})
+          ids_written("NODE1"), {"IFD_target": "2026-10-24", "IFN_dur": 3.0})
 
 
 def test_cascade_falls_back_when_the_stored_chain_has_a_hole():
