@@ -66,4 +66,48 @@ jobs:
           { echo '```'
             python3 scripts/schedule_issues.py
             echo '```'
-          } | tee "$GITHUB_STEP_SUMMARY"
+          } | tee "$GITHUB_STEP_SUMMARY"          
+
+  # rel:parent marks a root issue: one with no parent issue, i.e. the head
+  # of a potential sub-issue chain. Sub issues never get the label.
+  label-parent:
+    if: github.event.action == 'opened'   # skipped for field_added and dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      LABEL: rel:parent
+    steps:
+      - name: Ensure label exists
+        run: |
+          gh api "repos/$REPO/labels/$LABEL" >/dev/null 2>&1 ||
+            gh label create "$LABEL" --color 1D76DB \
+              --description "Root issue: heads a sub-issue chain"
+
+      - name: Label root issues
+        run: |
+          set -o pipefail
+          query='query ($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              issue(number: $number) {
+                parent { number }
+                labels(first: 100) { nodes { name } }
+              }
+            }
+          }'
+          json=$(gh api graphql -f query="$query" \
+            -f owner="${REPO%%/*}" -f name="${REPO##*/}" -F number="$ISSUE_NUMBER")
+          parent=$(jq -r '.data.repository.issue.parent.number // empty' <<<"$json")
+          has_label=$(jq -r --arg l "$LABEL" \
+            '[.data.repository.issue.labels.nodes[].name] | index($l) != null' <<<"$json")
+          if [ -n "$parent" ]; then
+            summary="#$ISSUE_NUMBER: sub issue of #$parent — $LABEL not added"
+          elif [ "$has_label" = "true" ]; then
+            summary="#$ISSUE_NUMBER: already has $LABEL"
+          else
+            gh issue edit "$ISSUE_NUMBER" --add-label "$LABEL"
+            summary="#$ISSUE_NUMBER: $LABEL added"
+          fi
+          { echo '```'; echo "$summary"; echo '```'; } | tee "$GITHUB_STEP_SUMMARY"          
